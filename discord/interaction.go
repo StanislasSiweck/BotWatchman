@@ -1,58 +1,65 @@
 package discord
 
 import (
+	"bot-serveur-info/serveur"
 	"bot-serveur-info/sql"
 	"github.com/bwmarrin/discordgo"
 	"log"
+	"time"
 )
 
 var AllServers = map[string]sql.Server{}
+var Mes *discordgo.Message
 
-// InteractionCreate is a function that handles when a new Discord interaction is created.
-//
-// Parameters:
-// s *discordgo.Session: The current Discord session.
-// i *discordgo.InteractionCreate: Represents the creation of a new interaction in Discord.
-//
-// The function checks if the interaction is of type ApplicationCommand.
-// If it's not, the function immediately returns.
-// If it is, the function retrieves the command data from the interaction and
-// identifies the command name. Depending on the command name, it calls the respective function.
-// For 'addserver', it calls addServerCommand and for 'removeserver', it calls removeServerCommand.
+var (
+	commandsHandlers = map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
+		"server add": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+			addServerCommand(s, i)
+		},
+		"server remove": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+			removeServerCommand(s, i)
+		},
+	}
+	componentsHandlers = map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
+		"update": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+			ServerInfo()
+			response := &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "Refreshed",
+					Flags:   discordgo.MessageFlagsEphemeral,
+				},
+			}
+			_ = s.InteractionRespond(i.Interaction, response)
+		},
+	}
+)
+
 func InteractionCreate(s *discordgo.Session, i *discordgo.InteractionCreate) {
 
-	if i.Type != discordgo.InteractionApplicationCommand {
-		return
-	}
+	switch i.Type {
+	case discordgo.InteractionApplicationCommand:
+		data := i.ApplicationCommandData()
+		command := data.Name
 
-	data := i.ApplicationCommandData()
-
-	command := data.Name
-	switch command {
-	case "addserver":
-		addServerCommand(s, i, data)
-	case "removeserver":
-		removeServerCommand(s, i, data)
+		if len(data.Options) == 1 {
+			command = data.Name + " " + data.Options[0].Name
+		}
+		if h, ok := commandsHandlers[command]; ok {
+			h(s, i)
+		}
+	case discordgo.InteractionMessageComponent:
+		if h, ok := componentsHandlers[i.MessageComponentData().CustomID]; ok {
+			h(s, i)
+		}
 	}
 }
 
-// addServerCommand is a function that handles the command to add a new server
-// to the database and a local server list.
-//
-// Parameters:
-// s *discordgo.Session - The current Discord session.
-// i *discordgo.InteractionCreate - Represents an interaction creation event from Discord.
-// data discordgo.ApplicationCommandInteractionData - Represents the data of an application command interaction.
-//
-// The function retrieves the server details (game, IP, and port) from the data options,
-// and creates a new server instance with those details.
-// If the creation in the database is successful, it also adds the server to the AllServers map.
-// Then it sends a response to the Discord 'interaction' confirming that the server has been added.
-// If there are any errors along the way, these are logged.
-func addServerCommand(s *discordgo.Session, i *discordgo.InteractionCreate, data discordgo.ApplicationCommandInteractionData) {
+func addServerCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	appOption := i.ApplicationCommandData().Options[0]
 	server := sql.Server{
-		IP:   data.Options[0].StringValue(),
-		Port: data.Options[1].StringValue(),
+		IP:   appOption.Options[0].StringValue(),
+		Port: appOption.Options[1].StringValue(),
 	}
 
 	if err := sql.AddServer(server); err != nil { // Create the server in the database
@@ -73,23 +80,11 @@ func addServerCommand(s *discordgo.Session, i *discordgo.InteractionCreate, data
 	}
 }
 
-// removeServerCommand is a function that handles the removal of a server
-// from the local server list and the database.
-//
-// Parameters:
-// s *discordgo.Session - The current Discord session.
-// i *discordgo.InteractionCreate - Represents an interaction creation event from Discord.
-// data discordgo.ApplicationCommandInteractionData - Represents the data of an application command interaction.
-//
-// The function retrieves the server details (IP, and port) from the data options,
-// and then attempts to remove the server from the AllServers map and the database.
-// Upon successful removal of the server, it will send a message back to the Discord channel
-// through the provided session and interaction, notifying that the server has been removed.
-// If there are any errors along the way, they are logged.
-func removeServerCommand(s *discordgo.Session, i *discordgo.InteractionCreate, data discordgo.ApplicationCommandInteractionData) {
-	delete(AllServers, data.Options[0].StringValue()+":"+data.Options[1].StringValue()) // Remove from local list
+func removeServerCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	appOption := i.ApplicationCommandData().Options[0]
+	delete(AllServers, appOption.Options[0].StringValue()+":"+appOption.Options[1].StringValue()) // Remove from local list
 
-	ip, port := data.Options[0].StringValue(), data.Options[1].StringValue()
+	ip, port := appOption.Options[0].StringValue(), appOption.Options[1].StringValue()
 
 	if err := sql.RemoveServer(ip, port); err != nil { // Remove from database
 		log.Println(err)
@@ -104,5 +99,64 @@ func removeServerCommand(s *discordgo.Session, i *discordgo.InteractionCreate, d
 	})
 	if err != nil {
 		log.Println(err)
+	}
+}
+
+func RefreshServerInfo() {
+	for {
+		ServerInfo()
+		time.Sleep(1 * time.Minute)
+	}
+}
+
+func ServerInfo() {
+	var Fields []*discordgo.MessageEmbedField
+	for _, server := range AllServers {
+
+		info, err := serveur.GetServerInfo(server)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		Field := serveur.CreateField(info, server)
+
+		// adds the new field to the Fields slice
+		Fields = append(Fields, Field)
+	}
+
+	// edit a Discord message with the specified fields
+	content := ""
+	messageEdit := discordgo.MessageEdit{
+		Content: &content,
+		ID:      Mes.ID,
+		Channel: Mes.ChannelID,
+		Components: []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Emoji: discordgo.ComponentEmoji{
+							Name: "🔄",
+						},
+						Style:    discordgo.PrimaryButton,
+						CustomID: "update",
+					},
+				},
+			},
+		},
+		Embed: &discordgo.MessageEmbed{
+			Title:       "Server watch list",
+			Description: "━━━━━━━━━━━━━━━━━━━━━━━━",
+			Color:       0x5ad65c,
+			Footer: &discordgo.MessageEmbedFooter{
+				Text: "Update",
+			},
+			Timestamp: time.Now().Format(time.RFC3339),
+			Fields:    Fields,
+		},
+	}
+	_, err := DG.ChannelMessageEditComplex(&messageEdit)
+	if err != nil {
+		log.Fatal(err)
 	}
 }
